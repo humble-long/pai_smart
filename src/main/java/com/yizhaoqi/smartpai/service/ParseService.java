@@ -40,6 +40,9 @@ public class ParseService {
     @Value("${file.parsing.max-memory-threshold:0.8}")
     private double maxMemoryThreshold;
 
+    @Value("${file.parsing.overlap-size:100}")
+    private int overlapSize;
+
     public ParseService() {
         // 无需初始化，StandardTokenizer是静态方法
     }
@@ -245,7 +248,32 @@ public class ParseService {
             chunks.add(currentChunk.toString().trim());
         }
 
-        return chunks;
+        return applyOverlap(chunks, overlapSize);
+    }
+
+    /**
+     * 为相邻 chunk 添加滑动窗口重叠，防止跨边界信息被割裂。
+     * chunk[i] 末尾 overlapSize 个字符会被追加到 chunk[i+1] 的开头。
+     *
+     * @param chunks      原始分块列表
+     * @param overlapSize 重叠窗口大小（字符数），0 表示不重叠
+     * @return 带重叠的分块列表
+     */
+    private List<String> applyOverlap(List<String> chunks, int overlapSize) {
+        if (overlapSize <= 0 || chunks.size() <= 1) {
+            return chunks;
+        }
+        List<String> result = new ArrayList<>(chunks.size());
+        result.add(chunks.get(0));
+        for (int i = 1; i < chunks.size(); i++) {
+            String prev = chunks.get(i - 1);
+            // 取前一个 chunk 末尾 overlapSize 字符作为上下文前缀
+            String overlap = prev.length() > overlapSize
+                    ? prev.substring(prev.length() - overlapSize)
+                    : prev;
+            result.add(overlap + chunks.get(i));
+        }
+        return result;
     }
 
     /**

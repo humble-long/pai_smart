@@ -71,6 +71,7 @@ admin:
 file:
   parsing:
     chunk-size: 512 # 每个文本块的最大字符数
+    overlap-size: 100  # 相邻 chunk 的重叠字符数，防止跨边界信息割裂
 
 elasticsearch:
   host: localhost       # Elasticsearch主机地址
