@@ -86,10 +86,17 @@ public class VectorizationService {
      * @param fileMd5 文件指纹
      * @return 分块内容列表
      */
-    // 从数据库获取分块内容
+    // 从数据库获取分块内容（仅获取子切片入 ES 向量索引；父切片在命中后由 HybridSearchService 回捞）
     private List<TextChunk> fetchTextChunks(String fileMd5) {
-        // 调用 Repository 查询数据
-        List<DocumentVector> vectors = documentVectorRepository.findByFileMd5(fileMd5);
+        // 只取 parentChunkId != null 的子切片（小粒度，检索精度高）
+        // 父切片（parentChunkId == null）不入向量索引，仅在检索后回捞提供完整上下文
+        List<DocumentVector> vectors = documentVectorRepository.findByFileMd5AndParentChunkIdIsNotNull(fileMd5);
+
+        if (vectors.isEmpty()) {
+            // 兼容旧数据（无父子关系时退化为全量）
+            logger.warn("未找到子切片，降级为全量获取，fileMd5: {}", fileMd5);
+            vectors = documentVectorRepository.findByFileMd5(fileMd5);
+        }
 
         // 转换为 TextChunk 列表
         return vectors.stream()

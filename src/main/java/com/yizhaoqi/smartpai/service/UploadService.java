@@ -16,7 +16,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.security.DigestInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
+import org.apache.commons.codec.binary.Hex;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -156,31 +160,32 @@ public class UploadService {
             
             // 如果分片未上传或需要重新上传
             if (!chunkUploaded) {
-                // 计算分片的 MD5 值
-                logger.debug("计算分片MD5 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
-                byte[] fileBytes = file.getBytes();
-                chunkMd5 = DigestUtils.md5Hex(fileBytes);
-                logger.debug("分片MD5计算完成 => fileMd5: {}, fileName: {}, chunkIndex: {}, chunkMd5: {}", 
-                           fileMd5, fileName, chunkIndex, chunkMd5);
-                           
                 // 构建分片的存储路径
                 storagePath = "chunks/" + fileMd5 + "/" + chunkIndex;
                 logger.debug("构建分片存储路径 => fileName: {}, path: {}", fileName, storagePath);
 
                 try {
-                    // 存储到 MinIO
-                    logger.info("开始上传分片到MinIO => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, bucket: uploads, path: {}, size: {}, contentType: {}", 
-                              fileMd5, fileName, fileType, chunkIndex, storagePath, file.getSize(), contentType);
-                    
-                    PutObjectArgs putObjectArgs = PutObjectArgs.builder()
-                            .bucket("uploads")
-                            .object(storagePath)
-                            .stream(file.getInputStream(), file.getSize(), -1)
-                            .contentType(file.getContentType())
-                            .build();
-                    
-                    minioClient.putObject(putObjectArgs);
-                    logger.info("分片上传到MinIO成功 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}", fileMd5, fileName, fileType, chunkIndex);
+                    // 用 DigestInputStream 包裹原始流：数据流过时动态计算 MD5，全程不产生额外 byte[]，
+                    // 分片内容经 HTTP socket 缓冲区（约 8KB）直接写入 MinIO，JVM 堆零拷贝。
+                    logger.debug("计算分片MD5（流式）=> fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
+                    MessageDigest digest = MessageDigest.getInstance("MD5");
+                    try (DigestInputStream dis = new DigestInputStream(file.getInputStream(), digest)) {
+                        logger.info("开始上传分片到MinIO => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, bucket: uploads, path: {}, size: {}, contentType: {}",
+                                  fileMd5, fileName, fileType, chunkIndex, storagePath, file.getSize(), contentType);
+                        PutObjectArgs putObjectArgs = PutObjectArgs.builder()
+                                .bucket("uploads")
+                                .object(storagePath)
+                                .stream(dis, file.getSize(), -1)
+                                .contentType(file.getContentType())
+                                .build();
+                        minioClient.putObject(putObjectArgs);
+                    }
+                    // putObject 完成 → DigestInputStream 已消费全部字节 → digest.digest() 即为分片 MD5
+                    chunkMd5 = Hex.encodeHexString(digest.digest());
+                    logger.info("分片上传到MinIO成功 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, chunkMd5: {}",
+                              fileMd5, fileName, fileType, chunkIndex, chunkMd5);
+                } catch (NoSuchAlgorithmException e) {
+                    throw new RuntimeException("MD5算法不可用", e);
                 } catch (Exception e) {
                     logger.error("分片上传到MinIO失败 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}, 错误类型: {}, 错误信息: {}", 
                               fileMd5, fileName, fileType, chunkIndex, e.getClass().getName(), e.getMessage(), e);

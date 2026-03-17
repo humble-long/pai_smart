@@ -8,6 +8,7 @@ import com.yizhaoqi.smartpai.entity.EsDocument;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import com.yizhaoqi.smartpai.model.User;
 import com.yizhaoqi.smartpai.exception.CustomException;
+import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import com.yizhaoqi.smartpai.repository.UserRepository;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.model.FileUpload;
@@ -58,6 +59,9 @@ public class HybridSearchService {
 
     @Autowired
     private RerankClient rerankClient;
+
+    @Autowired
+    private DocumentVectorRepository documentVectorRepository;
 
     /**
      * 混合检索专用线程池：核心2线程（对应双路并行），最大4线程，队列容量20。
@@ -151,6 +155,8 @@ public class HybridSearchService {
         logger.debug("重排序完成，最终返回 {} 条", reranked.size());
 
         attachFileNames(reranked);
+        // 子切片命中后回捞父切片，为 LLM 提供完整上下文
+        swapInParentText(reranked);
         return reranked;
     }
 
@@ -508,6 +514,37 @@ public class HybridSearchService {
             results.forEach(r -> r.setFileName(md5ToName.get(r.getFileMd5())));
         } catch (Exception e) {
             logger.error("补充文件名失败", e);
+        }
+    }
+
+    /**
+     * 父子切片回捞：将子切片（小粒度，用于精准检索）替换为其对应的父切片文本（大粒度，提供完整上下文）。
+     * <p>
+     * 若 DocumentVector 中记录了 parentChunkId，说明当前结果是子切片，
+     * 此时从 MySQL 查询父切片文本并覆盖 textContent，让 LLM 看到完整语义段落。
+     * 对无父子关系的旧数据（parentChunkId == null）保持原文不变。
+     * </p>
+     */
+    private void swapInParentText(List<SearchResult> results) {
+        if (results == null || results.isEmpty()) return;
+        for (SearchResult r : results) {
+            try {
+                documentVectorRepository.findByFileMd5AndChunkId(r.getFileMd5(), r.getChunkId())
+                        .ifPresent(child -> {
+                            Integer parentId = child.getParentChunkId();
+                            if (parentId != null) {
+                                documentVectorRepository
+                                        .findByFileMd5AndChunkId(r.getFileMd5(), parentId)
+                                        .ifPresent(parent -> {
+                                            r.setTextContent(parent.getTextContent());
+                                            logger.debug("父切片回捞成功，fileMd5: {}, childChunk: {}, parentChunk: {}",
+                                                    r.getFileMd5(), r.getChunkId(), parentId);
+                                        });
+                            }
+                        });
+            } catch (Exception e) {
+                logger.warn("父切片回捞失败，fileMd5: {}, chunkId: {}，保持子切片文本", r.getFileMd5(), r.getChunkId());
+            }
         }
     }
 }

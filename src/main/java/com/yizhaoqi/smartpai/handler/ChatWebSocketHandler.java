@@ -49,28 +49,36 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             // 检查是否是JSON格式的系统指令
             if (payload.trim().startsWith("{")) {
                 try {
+                    @SuppressWarnings("unchecked")
                     Map<String, Object> jsonMessage = objectMapper.readValue(payload, Map.class);
                     String messageType = (String) jsonMessage.get("type");
                     String internalToken = (String) jsonMessage.get("_internal_cmd_token");
                     
                     // 只有包含正确内部令牌的停止指令才处理
                     if ("stop".equals(messageType) && INTERNAL_CMD_TOKEN.equals(internalToken)) {
-                        // 处理停止指令
                         logger.info("收到有效的停止按钮指令，用户ID: {}，会话ID: {}", userId, session.getId());
                         chatHandler.stopResponse(userId, session);
                         return;
                     }
-                    
+
+                    // JSON 聊天消息：支持 {"message":"...", "conversationId":"..."}
+                    if (jsonMessage.containsKey("message")) {
+                        String chatMessage = (String) jsonMessage.get("message");
+                        String conversationId = (String) jsonMessage.get("conversationId");
+                        logger.debug("收到JSON聊天消息，conversationId: {}", conversationId);
+                        chatHandler.processMessage(userId, chatMessage, conversationId, session);
+                        return;
+                    }
+
                     // 其他JSON消息当作普通消息处理
                     logger.debug("收到JSON格式的聊天消息，当作普通消息处理");
                 } catch (Exception jsonParseError) {
-                    // JSON解析失败，当作普通文本消息处理
                     logger.debug("JSON解析失败，当作普通消息处理: {}", jsonParseError.getMessage());
                 }
             }
             
-            // 普通聊天消息处理（保持向下兼容）
-            chatHandler.processMessage(userId, payload, session);
+            // 纯文本消息（向下兼容，conversationId=null 自动创建新会话）
+            chatHandler.processMessage(userId, payload, null, session);
             
         } catch (Exception e) {
             logger.error("处理消息出错，用户ID: {}，会话ID: {}，错误: {}", 

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const chatStore = useChatStore();
-const { input, list, wsStatus, wsData } = storeToRefs(chatStore);
+const { input, list, streamStatus, streamData } = storeToRefs(chatStore);
 
 const latestMessage = computed(() => {
   return list.value[list.value.length - 1] ?? {};
@@ -13,12 +13,15 @@ const isSending = computed(() => {
 });
 
 const sendable = computed(
-  () => (!input.value.message && !isSending) || ['CLOSED', 'CONNECTING'].includes(wsStatus.value)
+  () => (!input.value.message && !isSending) || (streamStatus.value === 'CONNECTING' && !isSending.value)
 );
 
-watch(wsData, val => {
+watch(streamData, val => {
+  if (!val) return;
+
   const data = JSON.parse(val);
   const assistant = list.value[list.value.length - 1];
+  if (!assistant) return;
 
   if (data.type === 'completion' && data.status === 'finished' && assistant.status !== 'error')
     assistant.status = 'finished';
@@ -32,10 +35,7 @@ watch(wsData, val => {
 const handleSend = async () => {
   //  判断是否正在发送, 如果发送中，则停止ai继续响应
   if (isSending.value) {
-    const { error, data } = await request<Api.Chat.Token>({ url: 'chat/websocket-token', baseURL: 'proxy-api' });
-    if (error) return;
-
-    chatStore.wsSend(JSON.stringify({ type: 'stop', _internal_cmd_token: data.cmdToken }));
+    chatStore.stopMessageStream();
 
     list.value[list.value.length - 1].status = 'finished';
     if (!latestMessage.value.content) list.value.pop();
@@ -46,13 +46,23 @@ const handleSend = async () => {
     content: input.value.message,
     role: 'user'
   });
-  chatStore.wsSend(input.value.message);
+  // 发送 JSON 格式，携带当前会话 ID
+  const outgoingMessage = input.value.message;
   list.value.push({
     content: '',
     role: 'assistant',
     status: 'pending'
   });
   input.value.message = '';
+
+  try {
+    await chatStore.sendMessage(outgoingMessage);
+  } catch {
+    const assistant = list.value[list.value.length - 1];
+    if (assistant?.role === 'assistant') {
+      assistant.status = 'error';
+    }
+  }
 };
 
 const inputRef = ref();
@@ -98,8 +108,8 @@ const handShortcut = (e: KeyboardEvent) => {
     <div class="flex items-center justify-between pt-2">
       <div class="flex items-center text-18px color-gray-500">
         <NText class="text-14px">连接状态：</NText>
-        <icon-eos-icons:loading v-if="wsStatus === 'CONNECTING'" class="color-yellow" />
-        <icon-fluent:plug-connected-checkmark-20-filled v-else-if="wsStatus === 'OPEN'" class="color-green" />
+        <icon-eos-icons:loading v-if="streamStatus === 'CONNECTING'" class="color-yellow" />
+        <icon-fluent:plug-connected-checkmark-20-filled v-else-if="streamStatus === 'OPEN'" class="color-green" />
         <icon-tabler:plug-connected-x v-else class="color-red" />
       </div>
       <NButton :disabled="sendable" strong circle type="primary" @click="handleSend">

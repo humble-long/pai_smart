@@ -2,6 +2,7 @@ package com.yizhaoqi.smartpai.service;
 
 import com.yizhaoqi.smartpai.model.DocumentVector;
 import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
+import org.apache.poi.ss.usermodel.*;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
@@ -43,6 +44,25 @@ public class ParseService {
     @Value("${file.parsing.overlap-size:100}")
     private int overlapSize;
 
+    @Value("${file.parsing.excel.rows-per-chunk:10}")
+    private int excelRowsPerChunk;
+
+    @Value("${file.parsing.excel.overlap-rows:2}")
+    private int excelOverlapRows;
+
+    /**
+     * 子切片大小（字符数）。子切片入 ES 索引用于精准检索，命中后回捞父切片（chunkSize）传给 LLM。
+     */
+    @Value("${file.parsing.child-chunk-size:128}")
+    private int childChunkSize;
+
+    /**
+     * 子切片滑动窗口重叠大小（字符数）。每个子切片开头会重复前一个子切片末尾的若干字符，
+     * 防止句子在切片边界被截断。有效步长 = childChunkSize - childOverlapSize。
+     */
+    @Value("${file.parsing.child-overlap-size:32}")
+    private int childOverlapSize;
+
     public ParseService() {
         // 无需初始化，StandardTokenizer是静态方法
     }
@@ -60,12 +80,20 @@ public class ParseService {
      * @throws TikaException 如果文件解析过程中发生错误
      */
     public void parseAndSave(String fileMd5, InputStream fileStream,
-            String userId, String orgTag, boolean isPublic) throws IOException, TikaException {
-        logger.info("开始流式解析文件，fileMd5: {}, userId: {}, orgTag: {}, isPublic: {}",
-                fileMd5, userId, orgTag, isPublic);
+            String fileName, String userId, String orgTag, boolean isPublic) throws IOException, TikaException {
+        logger.info("开始流式解析文件，fileMd5: {}, fileName: {}, userId: {}, orgTag: {}, isPublic: {}",
+                fileMd5, fileName, userId, orgTag, isPublic);
 
         checkMemoryThreshold();
 
+        // 根据文件扩展名路由到不同解析器
+        if (isExcelFile(fileName)) {
+            logger.info("检测到 Excel 文件，使用表格专用切片逻辑");
+            parseAndSaveExcel(fileMd5, fileStream, userId, orgTag, isPublic);
+            return;
+        }
+
+        // 非 Excel 文件：原有 Tika 流式解析逻辑
         try (BufferedInputStream bufferedStream = new BufferedInputStream(fileStream, bufferSize)) {
             // 创建一个流式处理器，它会在内部处理父块的切分和子块的保存
             StreamingContentHandler handler = new StreamingContentHandler(fileMd5, userId, orgTag, isPublic);
@@ -90,7 +118,154 @@ public class ParseService {
      */
     public void parseAndSave(String fileMd5, InputStream fileStream) throws IOException, TikaException {
         // 使用默认值调用新方法
-        parseAndSave(fileMd5, fileStream, "unknown", "DEFAULT", false);
+        parseAndSave(fileMd5, fileStream, null, "unknown", "DEFAULT", false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Excel 专用解析逻辑
+    // -----------------------------------------------------------------------
+
+    /** 判断是否为 Excel 文件（.xls / .xlsx） */
+    private boolean isExcelFile(String fileName) {
+        if (fileName == null) return false;
+        String lower = fileName.toLowerCase();
+        return lower.endsWith(".xls") || lower.endsWith(".xlsx");
+    }
+
+    /**
+     * Excel 表格专用切片：每行携带表头重建为自然语言，避免表头与数据分离问题。
+     * <p>
+     * 切片策略：
+     * - 以"行组"为单位，每 {@code excelRowsPerChunk} 行生成一个 chunk。
+     * - 相邻 chunk 重叠 {@code excelOverlapRows} 行，保证跨 chunk 查询时上下文完整。
+     * - 每行格式：【Sheet名】列名1：值1，列名2：值2。
+     * </p>
+     */
+    private void parseAndSaveExcel(String fileMd5, InputStream fileStream,
+            String userId, String orgTag, boolean isPublic) throws IOException {
+        try (Workbook workbook = WorkbookFactory.create(fileStream)) {
+            int totalChunksSaved = 0;
+
+            for (int sheetIdx = 0; sheetIdx < workbook.getNumberOfSheets(); sheetIdx++) {
+                Sheet sheet = workbook.getSheetAt(sheetIdx);
+                String sheetName = sheet.getSheetName();
+                logger.info("解析 Sheet[{}]: {}", sheetIdx, sheetName);
+
+                // 读取表头（第一行）
+                Row headerRow = sheet.getRow(sheet.getFirstRowNum());
+                if (headerRow == null) {
+                    logger.warn("Sheet[{}] 无表头，跳过", sheetName);
+                    continue;
+                }
+                List<String> headers = new ArrayList<>();
+                for (Cell cell : headerRow) {
+                    headers.add(getCellValueAsString(cell, workbook));
+                }
+                // 过滤空列名（末尾的空列通常是 Excel 占位符）
+                int lastNonEmptyHeader = headers.size() - 1;
+                while (lastNonEmptyHeader >= 0 && headers.get(lastNonEmptyHeader).isBlank()) {
+                    lastNonEmptyHeader--;
+                }
+                if (lastNonEmptyHeader < 0) {
+                    logger.warn("Sheet[{}] 表头全为空，跳过", sheetName);
+                    continue;
+                }
+                headers = headers.subList(0, lastNonEmptyHeader + 1);
+                logger.debug("Sheet[{}] 有效列数: {}, 表头: {}", sheetName, headers.size(), headers);
+
+                // 收集所有有效数据行的自然语言描述
+                List<String> rowDescriptions = new ArrayList<>();
+                int firstDataRow = sheet.getFirstRowNum() + 1;
+                for (int rowIdx = firstDataRow; rowIdx <= sheet.getLastRowNum(); rowIdx++) {
+                    Row row = sheet.getRow(rowIdx);
+                    if (row == null || isRowEmpty(row, headers.size())) continue;
+
+                    StringBuilder rowDesc = new StringBuilder();
+                    rowDesc.append("【").append(sheetName).append("】");
+                    boolean hasData = false;
+                    for (int colIdx = 0; colIdx < headers.size(); colIdx++) {
+                        String header = headers.get(colIdx);
+                        if (header.isBlank()) continue;
+                        Cell cell = row.getCell(colIdx, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+                        String value = cell != null ? getCellValueAsString(cell, workbook) : "";
+                        if (!value.isBlank()) {
+                            rowDesc.append(header).append("：").append(value).append("，");
+                            hasData = true;
+                        }
+                    }
+                    if (!hasData) continue;
+                    // 去掉末尾逗号，改为句号
+                    String desc = rowDesc.toString().replaceAll("，$", "。");
+                    rowDescriptions.add(desc);
+                }
+                logger.info("Sheet[{}] 共 {} 条有效数据行", sheetName, rowDescriptions.size());
+
+                // 按滑动窗口生成带重叠的 chunk
+                totalChunksSaved = buildExcelChunks(
+                        fileMd5, rowDescriptions, userId, orgTag, isPublic, totalChunksSaved);
+            }
+            logger.info("Excel 解析完成，fileMd5: {}, 总 chunk 数: {}", fileMd5, totalChunksSaved);
+        } catch (Exception e) {
+            logger.error("Excel 解析失败，fileMd5: {}", fileMd5, e);
+            throw new IOException("Excel 解析失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 将行描述列表按滑动窗口切成带重叠的 chunk 并保存。
+     * <p>
+     * 窗口步长 = {@code excelRowsPerChunk - excelOverlapRows}，
+     * 保证每个 chunk 开头包含 {@code excelOverlapRows} 行上一个 chunk 末尾的内容。
+     * </p>
+     *
+     * @return 保存后总的 chunk 数量
+     */
+    private int buildExcelChunks(String fileMd5, List<String> rowDescs,
+            String userId, String orgTag, boolean isPublic, int startId) {
+        if (rowDescs.isEmpty()) return startId;
+
+        int step = Math.max(1, excelRowsPerChunk - excelOverlapRows);
+        int total = startId;
+
+        for (int i = 0; i < rowDescs.size(); i += step) {
+            int end = Math.min(i + excelRowsPerChunk, rowDescs.size());
+            List<String> group = rowDescs.subList(i, end);
+
+            // 父切片：多行合并的完整语义块，供 LLM 见到完整上下文
+            total++;
+            int parentId = total;
+            String parentContent = String.join("\n", group);
+            saveDocumentVector(fileMd5, parentId, parentContent, null, userId, orgTag, isPublic);
+
+            // 子切片：每行单独存储，精细粒度入 ES 向量索引提升检索命中率
+            for (String rowDesc : group) {
+                total++;
+                saveDocumentVector(fileMd5, total, rowDesc, parentId, userId, orgTag, isPublic);
+            }
+
+            if (end >= rowDescs.size()) break;
+        }
+        return total;
+    }
+
+    /** 将单元格值统一转为字符串（处理数字、日期、公式等类型） */
+    private String getCellValueAsString(Cell cell, Workbook workbook) {
+        if (cell == null) return "";
+        DataFormatter formatter = new DataFormatter();
+        return formatter.formatCellValue(cell).trim();
+    }
+
+    /** 判断一行是否全为空（只检查有效列范围内） */
+    private boolean isRowEmpty(Row row, int colCount) {
+        if (row == null) return true;
+        for (int i = 0; i < colCount; i++) {
+            Cell cell = row.getCell(i, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+            if (cell != null && cell.getCellType() != CellType.BLANK) {
+                String val = new DataFormatter().formatCellValue(cell).trim();
+                if (!val.isEmpty()) return false;
+            }
+        }
+        return true;
     }
 
     private void checkMemoryThreshold() {
@@ -160,45 +335,51 @@ public class ParseService {
             String parentChunkText = buffer.toString();
             logger.debug("处理父文本块，大小: {} bytes", parentChunkText.length());
 
-            // 1. 将父块分割成更小的、有语义的子切片
-            List<String> childChunks = ParseService.this.splitTextIntoChunksWithSemantics(parentChunkText, chunkSize);
+            // Level-1：将 1MB 缓冲区切割为语义完整的父切片（chunkSize 字符，默认 512）
+            List<String> parentTexts = ParseService.this.splitTextIntoChunksWithSemantics(parentChunkText, chunkSize);
 
-            // 2. 将子切片批量保存到数据库
-            this.savedChunkCount = ParseService.this.saveChildChunks(fileMd5, childChunks, userId, orgTag, isPublic,
-                    this.savedChunkCount);
+            for (String parentText : parentTexts) {
+                // 存父切片（parentChunkId = null）
+                this.savedChunkCount++;
+                int parentId = this.savedChunkCount;
+                ParseService.this.saveDocumentVector(fileMd5, parentId, parentText, null, userId, orgTag, isPublic);
 
-            // 3. 清空缓冲区，为下一个父块做准备
+                // Level-2：将父切片按滑动窗口切为子切片（childChunkSize 字符，步长 = size - overlap）——打入 ES 索引
+                // 父切片已完成语义对齐，子切片等宽截取+overlap防止句子被截断
+                int childSize = ParseService.this.childChunkSize;
+                int childOverlap = ParseService.this.childOverlapSize;
+                int effectiveStep = Math.max(1, childSize - childOverlap);
+                for (int i = 0; i < parentText.length(); i += effectiveStep) {
+                    int end = Math.min(i + childSize, parentText.length());
+                    String childText = parentText.substring(i, end);
+                    this.savedChunkCount++;
+                    ParseService.this.saveDocumentVector(fileMd5, this.savedChunkCount, childText, parentId, userId, orgTag, isPublic);
+                    if (end >= parentText.length()) break;  // 最后一段直接退出，避免重复保存末尾短片段
+                }
+            }
+            logger.info("父切片处理完成，本批 {} 个父切片", parentTexts.size());
+
+            // 清空缓冲区，为下一个父块做准备
             buffer.setLength(0);
         }
     }
 
     /**
-     * 将子切片列表保存到数据库。
+     * 保存单个 DocumentVector，支持父子切片关联。
      *
-     * @param fileMd5         文件的 MD5 哈希值
-     * @param chunks          子切片文本列表
-     * @param userId          上传用户ID
-     * @param orgTag          组织标签
-     * @param isPublic        是否公开
-     * @param startingChunkId 当前批次的起始分片ID
-     * @return 保存后总的分片数量
+     * @param parentChunkId null = 该切片本身是父切片；有值 = 子切片，指向父切片 chunkId
      */
-    private int saveChildChunks(String fileMd5, List<String> chunks,
-            String userId, String orgTag, boolean isPublic, int startingChunkId) {
-        int currentChunkId = startingChunkId;
-        for (String chunk : chunks) {
-            currentChunkId++;
-            var vector = new DocumentVector();
-            vector.setFileMd5(fileMd5);
-            vector.setChunkId(currentChunkId);
-            vector.setTextContent(chunk);
-            vector.setUserId(userId);
-            vector.setOrgTag(orgTag);
-            vector.setPublic(isPublic);
-            documentVectorRepository.save(vector);
-        }
-        logger.info("成功保存 {} 个子切片到数据库", chunks.size());
-        return currentChunkId;
+    private void saveDocumentVector(String fileMd5, int chunkId, String text,
+            Integer parentChunkId, String userId, String orgTag, boolean isPublic) {
+        var vector = new DocumentVector();
+        vector.setFileMd5(fileMd5);
+        vector.setChunkId(chunkId);
+        vector.setTextContent(text);
+        vector.setParentChunkId(parentChunkId);
+        vector.setUserId(userId);
+        vector.setOrgTag(orgTag);
+        vector.setPublic(isPublic);
+        documentVectorRepository.save(vector);
     }
 
     /**

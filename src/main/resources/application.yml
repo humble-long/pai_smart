@@ -70,10 +70,15 @@ admin:
 
 file:
   parsing:
-    chunk-size: 512 # 每个文本块的最大字符数
+    chunk-size: 512        # 父切片大小（字符数），供 LLM 获取完整上下文
+    child-chunk-size: 128  # 子切片大小（字符数），入 ES 向量索引，精准检索后回捞父切片
+    child-overlap-size: 32  # 子切片滑动窗口重叠（字符数），防止句子在切片边界截断；有效步长 = child-chunk-size - child-overlap-size
     overlap-size: 100  # 相邻 chunk 的重叠字符数，防止跨边界信息割裂
     buffer-size: 8192    # 8KB 缓冲区
     max-memory-threshold: 0.8  # 80% 内存阈值
+    excel:
+      rows-per-chunk: 10   # Excel 每个父切片包含的行数
+      overlap-rows: 2      # 相邻父切片重叠的行数（携带表头上下文）
 
 elasticsearch:
   host: localhost       # Elasticsearch主机地址

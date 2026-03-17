@@ -46,4 +46,11 @@ public class DocumentVector {
      */
     @Column(name = "is_public", nullable = false)
     private boolean isPublic = false;
+
+    /**
+     * 父切片的 chunkId（null = 本行自身是父切片；有值 = 本行是子切片，指向父切片的 chunkId）。
+     * 父子切片策略：子切片（128字符）用于 ES 精准检索，命中后回捞父切片（512字符）传给 LLM 提供完整上下文。
+     */
+    @Column(name = "parent_chunk_id")
+    private Integer parentChunkId;
 }

@@ -10,6 +10,15 @@ import java.util.List;
 
 public interface DocumentVectorRepository extends JpaRepository<DocumentVector, Long> {
     List<DocumentVector> findByFileMd5(String fileMd5); // 查询某文件的所有分块
+
+    /** 查询某文件的所有子切片（parentChunkId != null → 这些是用于 ES 检索的子切片） */
+    List<DocumentVector> findByFileMd5AndParentChunkIdIsNotNull(String fileMd5);
+
+    /** 查询某文件的所有父切片（parentChunkId == null） */
+    List<DocumentVector> findByFileMd5AndParentChunkIdIsNull(String fileMd5);
+
+    /** 通过文件指纹 + chunkId 精确查找单个切片（用于父切片回捞）*/
+    java.util.Optional<DocumentVector> findByFileMd5AndChunkId(String fileMd5, Integer chunkId);
     
     /**
      * 删除指定文件MD5的所有文档向量记录

@@ -20,7 +20,6 @@ import com.yizhaoqi.smartpai.model.IntentType;
 public class DeepSeekClient {
 
     private final WebClient webClient;
-    private final String apiKey;
     private final String model;
     private final AiProperties aiProperties;
     private static final Logger logger = LoggerFactory.getLogger(DeepSeekClient.class);
@@ -37,7 +36,6 @@ public class DeepSeekClient {
         }
         
         this.webClient = builder.build();
-        this.apiKey = apiKey;
         this.model = model;
         this.aiProperties = aiProperties;
     }
@@ -47,6 +45,15 @@ public class DeepSeekClient {
                              List<Map<String, String>> history,
                              Consumer<String> onChunk,
                              Consumer<Throwable> onError) {
+        streamResponse(userMessage, context, history, onChunk, onError, () -> {});
+        }
+
+        public void streamResponse(String userMessage,
+                     String context,
+                     List<Map<String, String>> history,
+                     Consumer<String> onChunk,
+                     Consumer<Throwable> onError,
+                     Runnable onComplete) {
         
         Map<String, Object> request = buildRequest(userMessage, context, history);
         
@@ -58,7 +65,8 @@ public class DeepSeekClient {
                 .bodyToFlux(String.class)
                 .subscribe(
                     chunk -> processChunk(chunk, onChunk),
-                    onError
+                    onError,
+                    onComplete
                 );
     }
     

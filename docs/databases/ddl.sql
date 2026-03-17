@@ -53,5 +53,7 @@ CREATE TABLE document_vectors (
                                   model_version VARCHAR(32) COMMENT '向量模型版本',
                                   user_id VARCHAR(64) NOT NULL COMMENT '上传用户ID',
                                   org_tag VARCHAR(50) COMMENT '文件所属组织标签',
-                                  is_public BOOLEAN NOT NULL DEFAULT FALSE COMMENT '文件是否公开'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档向量存储表';
+                                  is_public BOOLEAN NOT NULL DEFAULT FALSE COMMENT '文件是否公开',
+                                  parent_chunk_id INT DEFAULT NULL COMMENT '父切片 chunkId（NULL=本行是父切片；有值=本行是子切片，指向父切片）',
+                                  INDEX idx_file_chunk (file_md5, chunk_id) COMMENT '父子切片回捞索引'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档向量存储表（父子切片：子切片入ES检索，命中后回捞父切片文本给LLM）';

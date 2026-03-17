@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -53,12 +54,12 @@ public class ChatHandler {
         this.objectMapper = new ObjectMapper();
     }
 
-    public void processMessage(String userId, String userMessage, WebSocketSession session) {
+    public void processMessage(String userId, String userMessage, String conversationId, WebSocketSession session) {
         logger.info("开始处理消息，用户ID: {}, 会话ID: {}", userId, session.getId());
         try {
-            // 1. 获取或创建会话 ID
-            String conversationId = getOrCreateConversationId(userId);
-            logger.info("会话ID: {}, 用户ID: {}", conversationId, userId);
+            // 1. 获取或创建会话 ID（兼容 null：自动创建新会话）
+            final String resolvedConvId = getOrCreateConversationId(userId, conversationId);
+            logger.info("会话ID: {}, 用户ID: {}", resolvedConvId, userId);
             
             // 为当前会话创建响应构建器
             responseBuilders.put(session.getId(), new StringBuilder());
@@ -67,7 +68,7 @@ public class ChatHandler {
             responseFutures.put(session.getId(), responseFuture);
             
             // 2. 获取对话历史
-            List<Map<String, String>> history = getConversationHistory(conversationId);
+            List<Map<String, String>> history = getConversationHistory(resolvedConvId);
             logger.debug("获取到 {} 条历史对话", history.size());
 
             // 3. 使用 LLM 对问题进行改写，提升检索质量（失败时自动回退到原始问题）
@@ -152,11 +153,10 @@ public class ChatHandler {
                             
                             // 更新对话历史
                             String completeResponse = responseBuilder.toString();
-                            updateConversationHistory(conversationId, userMessage, completeResponse);
+                            updateConversationHistory(resolvedConvId, userMessage, completeResponse);
                             
                             // 输出对话存储信息以便调试
-                            String redisKey = "user:" + userId + ":current_conversation";
-                            logger.info("对话存储信息 - Redis键: {}, 值: {}", redisKey, conversationId);
+                            logger.info("对话存储完成 - 会话ID: {}, 用户: {}", resolvedConvId, userId);
                             
                             // 清理会话响应构建器
                             responseBuilders.remove(session.getId());
@@ -181,11 +181,10 @@ public class ChatHandler {
                                         
                                         // 更新对话历史
                                         String completeResponse = responseBuilder.toString();
-                                        updateConversationHistory(conversationId, userMessage, completeResponse);
+                                        updateConversationHistory(resolvedConvId, userMessage, completeResponse);
                                         
                                         // 输出对话存储信息以便调试
-                                        String redisKey = "user:" + userId + ":current_conversation";
-                                        logger.info("对话存储信息 - Redis键: {}, 值: {}", redisKey, conversationId);
+                                        logger.info("对话存储完成 - 会话ID: {}, 用户: {}", resolvedConvId, userId);
                                         
                                         // 清理会话响应构建器
                                         responseBuilders.remove(session.getId());
@@ -205,11 +204,10 @@ public class ChatHandler {
                                 
                                 // 更新对话历史
                                 String completeResponse = responseBuilder.toString();
-                                updateConversationHistory(conversationId, userMessage, completeResponse);
+                                updateConversationHistory(resolvedConvId, userMessage, completeResponse);
                                 
                                 // 输出对话存储信息以便调试
-                                String redisKey = "user:" + userId + ":current_conversation";
-                                logger.info("对话存储信息 - Redis键: {}, 值: {}", redisKey, conversationId);
+                                logger.info("对话存储信息 - 会话ID: {}, 用户: {}", resolvedConvId, userId);
                                 
                                 // 清理会话响应构建器
                                 responseBuilders.remove(session.getId());
@@ -247,19 +245,110 @@ public class ChatHandler {
         }
     }
 
-    private String getOrCreateConversationId(String userId) {
-        String key = "user:" + userId + ":current_conversation";
-        String conversationId = redisTemplate.opsForValue().get(key);
-        
-        if (conversationId == null) {
-            conversationId = UUID.randomUUID().toString();
-            redisTemplate.opsForValue().set(key, conversationId, Duration.ofDays(7));
-            logger.info("为用户 {} 创建新的会话ID: {}", userId, conversationId);
-        } else {
-            logger.info("获取到用户 {} 的现有会话ID: {}", userId, conversationId);
+    public void processMessageSse(String userId, String userMessage, String conversationId, SseEmitter emitter) {
+        logger.info("开始处理 SSE 消息，用户ID: {}", userId);
+        try {
+            final String resolvedConvId = getOrCreateConversationId(userId, conversationId);
+            List<Map<String, String>> history = getConversationHistory(resolvedConvId);
+
+            String rewrittenQuery = deepSeekClient.rewriteQuery(userMessage, history);
+            IntentType intent = deepSeekClient.recognizeIntent(userMessage, history);
+
+            String context;
+            switch (intent) {
+                case CHITCHAT -> context = "";
+                case MCP_TOOL -> {
+                    logger.info("意图为 MCP_TOOL，当前暂未接入工具，降级为知识库检索");
+                    List<SearchResult> toolFallbackResults = searchService.searchWithPermission(rewrittenQuery, userId, 5);
+                    context = buildContext(toolFallbackResults);
+                }
+                default -> {
+                    List<SearchResult> searchResults = searchService.searchWithPermission(rewrittenQuery, userId, 5);
+                    context = buildContext(searchResults);
+                }
+            }
+
+            StringBuilder responseBuilder = new StringBuilder();
+
+            deepSeekClient.streamResponse(userMessage, context, history,
+                    chunk -> {
+                        responseBuilder.append(chunk);
+                        sendSsePayload(emitter, Map.of("chunk", chunk));
+                    },
+                    error -> {
+                        logger.error("SSE 流式响应出错: {}", error.getMessage(), error);
+                        sendSsePayload(emitter, Map.of("error", "AI服务暂时不可用，请稍后重试"));
+                        emitter.completeWithError(error);
+                    },
+                    () -> {
+                        updateConversationHistory(resolvedConvId, userMessage, responseBuilder.toString());
+                        sendSsePayload(emitter, Map.of(
+                                "type", "completion",
+                                "status", "finished",
+                                "message", "响应已完成",
+                                "timestamp", System.currentTimeMillis(),
+                                "date", java.time.LocalDateTime.now().toString()
+                        ));
+                        emitter.complete();
+                    });
+        } catch (Exception e) {
+            logger.error("处理 SSE 消息失败: {}", e.getMessage(), e);
+            sendSsePayload(emitter, Map.of("error", "消息处理失败：" + e.getMessage()));
+            emitter.completeWithError(e);
         }
-        
+    }
+
+    private void sendSsePayload(SseEmitter emitter, Map<String, ?> payload) {
+        try {
+            emitter.send(SseEmitter.event().data(objectMapper.writeValueAsString(payload)));
+        } catch (Exception e) {
+            logger.error("发送 SSE 事件失败: {}", e.getMessage(), e);
+            emitter.completeWithError(e);
+        }
+    }
+
+    /**
+     * 获取或创建会话 ID。
+     * - conversationId 非空且属于该用户 → 直接使用
+     * - conversationId 为空 → 创建新会话并注册到用户会话列表
+     */
+    private String getOrCreateConversationId(String userId, String conversationId) {
+        String listKey = "user:" + userId + ":conversations";
+
+        if (conversationId != null && !conversationId.isBlank()) {
+            // 验证会话是否属于该用户（防止越权）
+            Double score = redisTemplate.opsForZSet().score(listKey, conversationId);
+            if (score != null) {
+                logger.info("使用已有会话 {} (用户: {})", conversationId, userId);
+                return conversationId;
+            }
+            logger.warn("会话 {} 不属于用户 {}，创建新会话", conversationId, userId);
+        }
+
+        // 创建新会话
+        conversationId = UUID.randomUUID().toString();
+        long now = System.currentTimeMillis();
+        // 注册到用户会话列表（score = 时间戳，便于按时间排序）
+        redisTemplate.opsForZSet().add(listKey, conversationId, now);
+        redisTemplate.expire(listKey, Duration.ofDays(30));
+        // 保存 meta（标题暂为空，第一条消息后更新）
+        redisTemplate.opsForHash().put("conversation:" + conversationId + ":meta", "createdAt",
+                String.valueOf(now));
+        redisTemplate.expire("conversation:" + conversationId + ":meta", Duration.ofDays(7));
+        logger.info("为用户 {} 创建新会话: {}", userId, conversationId);
         return conversationId;
+    }
+
+    /**
+     * 更新会话标题（取第一条用户消息的前 20 字）
+     */
+    private void updateConversationTitle(String conversationId, String userMessage) {
+        String metaKey = "conversation:" + conversationId + ":meta";
+        Object title = redisTemplate.opsForHash().get(metaKey, "title");
+        if (title == null) {
+            String shortTitle = userMessage.length() > 20 ? userMessage.substring(0, 20) + "…" : userMessage;
+            redisTemplate.opsForHash().put(metaKey, "title", shortTitle);
+        }
     }
 
     private List<Map<String, String>> getConversationHistory(String conversationId) {
@@ -283,6 +372,10 @@ public class ChatHandler {
     private void updateConversationHistory(String conversationId, String userMessage, String response) {
         String key = "conversation:" + conversationId;
         List<Map<String, String>> history = getConversationHistory(conversationId);
+        // 首条消息时设置会话标题
+        if (history.isEmpty()) {
+            updateConversationTitle(conversationId, userMessage);
+        }
         
         // 获取当前时间戳
         String currentTimestamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
@@ -317,18 +410,22 @@ public class ChatHandler {
 
     private String buildContext(List<SearchResult> searchResults) {
         if (searchResults == null || searchResults.isEmpty()) {
-            // 返回空字符串，让 DeepSeekClient 按"无检索结果"逻辑处理
             return "";
         }
 
-        final int MAX_SNIPPET_LEN = 300; // 单段最长字符数，超出截断
+        // 按总预算分配：排名高的条目优先保留完整内容
+        final int TOTAL_BUDGET = 4000; // 字符数 ≈ 2000 tokens，对 64K 上下文很保守
         StringBuilder context = new StringBuilder();
+        int remaining = TOTAL_BUDGET;
         for (int i = 0; i < searchResults.size(); i++) {
             SearchResult result = searchResults.get(i);
             String snippet = result.getTextContent();
-            if (snippet.length() > MAX_SNIPPET_LEN) {
-                snippet = snippet.substring(0, MAX_SNIPPET_LEN) + "…";
+            if (snippet == null) snippet = "";
+            if (remaining <= 0) break;
+            if (snippet.length() > remaining) {
+                snippet = snippet.substring(0, remaining) + "…";
             }
+            remaining -= snippet.length();
             String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
             context.append(String.format("[%d] (%s) %s\n", i + 1, fileLabel, snippet));
         }

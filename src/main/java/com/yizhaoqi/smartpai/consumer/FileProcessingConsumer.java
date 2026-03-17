@@ -54,7 +54,7 @@ public class FileProcessingConsumer {
 
             // 解析文件
             parseService.parseAndSave(task.getFileMd5(), fileStream, 
-                    task.getUserId(), task.getOrgTag(), task.isPublic());
+                    task.getFileName(), task.getUserId(), task.getOrgTag(), task.isPublic());
             log.info("文件解析完成，fileMd5: {}", task.getFileMd5());
 
             // 向量化处理

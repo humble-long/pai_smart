@@ -14,234 +14,259 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @RestController
-@RequestMapping("/api/v1/users/conversation")
+@RequestMapping("/api/v1/users")
 public class ConversationController {
 
     @Autowired
     private RedisTemplate<String, String> redisTemplate;
-    
+
     @Autowired
     private UserRepository userRepository;
 
     @Autowired
     private JwtUtils jwtUtils;
-    
+
     @Autowired
     private ObjectMapper objectMapper;
 
-    /**
-     * 查询对话历史，从Redis中获取
-     */
-    @GetMapping
-    public ResponseEntity<?> getConversations(
+    // ---------------------------------------------------------------
+    // 1. 查询当前用户所有会话列表
+    // GET /api/v1/users/conversations
+    // ---------------------------------------------------------------
+    @GetMapping("/conversations")
+    public ResponseEntity<?> listConversations(
+            @RequestHeader("Authorization") String token) {
+        try {
+            String username = extractUsername(token);
+            String userId = resolveUserId(username);
+            String listKey = "user:" + userId + ":conversations";
+
+            // 按创建时间倒序取所有会话 ID
+            Set<String> convIds = redisTemplate.opsForZSet()
+                    .reverseRange(listKey, 0, -1);
+            if (convIds == null) convIds = Collections.emptySet();
+
+            List<Map<String, Object>> result = new ArrayList<>();
+            for (String convId : convIds) {
+                Map<Object, Object> meta = redisTemplate.opsForHash()
+                        .entries("conversation:" + convId + ":meta");
+                Map<String, Object> item = new HashMap<>();
+                item.put("conversationId", convId);
+                item.put("title", meta.getOrDefault("title", "新对话"));
+                item.put("createdAt", meta.getOrDefault("createdAt", ""));
+                result.add(item);
+            }
+
+            return ok("获取会话列表成功", result);
+        } catch (CustomException e) {
+            return err(e.getStatus(), e.getMessage());
+        } catch (Exception e) {
+            return err(HttpStatus.INTERNAL_SERVER_ERROR, "服务器内部错误: " + e.getMessage());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 2. 创建新会话
+    // POST /api/v1/users/conversations
+    // ---------------------------------------------------------------
+    @PostMapping("/conversations")
+    public ResponseEntity<?> createConversation(
+            @RequestHeader("Authorization") String token) {
+        try {
+            String username = extractUsername(token);
+            String userId = resolveUserId(username);
+            String listKey = "user:" + userId + ":conversations";
+
+            String conversationId = UUID.randomUUID().toString();
+            long now = System.currentTimeMillis();
+            redisTemplate.opsForZSet().add(listKey, conversationId, now);
+            redisTemplate.expire(listKey, Duration.ofDays(30));
+            redisTemplate.opsForHash().put(
+                    "conversation:" + conversationId + ":meta", "createdAt", String.valueOf(now));
+            redisTemplate.expire("conversation:" + conversationId + ":meta", Duration.ofDays(7));
+
+            Map<String, Object> data = new HashMap<>();
+            data.put("conversationId", conversationId);
+            data.put("title", "新对话");
+            data.put("createdAt", now);
+            return ok("创建会话成功", data);
+        } catch (CustomException e) {
+            return err(e.getStatus(), e.getMessage());
+        } catch (Exception e) {
+            return err(HttpStatus.INTERNAL_SERVER_ERROR, "服务器内部错误: " + e.getMessage());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 3. 删除会话
+    // DELETE /api/v1/users/conversations/{id}
+    // ---------------------------------------------------------------
+    @DeleteMapping("/conversations/{id}")
+    public ResponseEntity<?> deleteConversation(
+            @RequestHeader("Authorization") String token,
+            @PathVariable("id") String conversationId) {
+        try {
+            String username = extractUsername(token);
+            String userId = resolveUserId(username);
+            String listKey = "user:" + userId + ":conversations";
+
+            // 校验归属
+            Double score = redisTemplate.opsForZSet().score(listKey, conversationId);
+            if (score == null) {
+                throw new CustomException("会话不存在或无权限删除", HttpStatus.NOT_FOUND);
+            }
+
+            redisTemplate.opsForZSet().remove(listKey, conversationId);
+            redisTemplate.delete("conversation:" + conversationId);
+            redisTemplate.delete("conversation:" + conversationId + ":meta");
+
+            return ok("删除会话成功", null);
+        } catch (CustomException e) {
+            return err(e.getStatus(), e.getMessage());
+        } catch (Exception e) {
+            return err(HttpStatus.INTERNAL_SERVER_ERROR, "服务器内部错误: " + e.getMessage());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 4. 查询指定会话的消息历史（支持时间过滤）
+    // GET /api/v1/users/conversations/{id}/messages
+    // ---------------------------------------------------------------
+    @GetMapping("/conversations/{id}/messages")
+    public ResponseEntity<?> getConversationMessages(
+            @RequestHeader("Authorization") String token,
+            @PathVariable("id") String conversationId,
+            @RequestParam(required = false) String start_date,
+            @RequestParam(required = false) String end_date) {
+        try {
+            String username = extractUsername(token);
+            String userId = resolveUserId(username);
+            // 校验归属
+            Double score = redisTemplate.opsForZSet().score(
+                    "user:" + userId + ":conversations", conversationId);
+            if (score == null) {
+                throw new CustomException("会话不存在或无权限访问", HttpStatus.NOT_FOUND);
+            }
+            List<Map<String, Object>> messages = loadMessages(conversationId, start_date, end_date, username);
+            return ok("获取消息历史成功", messages);
+        } catch (CustomException e) {
+            return err(e.getStatus(), e.getMessage());
+        } catch (Exception e) {
+            return err(HttpStatus.INTERNAL_SERVER_ERROR, "服务器内部错误: " + e.getMessage());
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 5. 兼容旧接口：查询当前活跃会话历史（向后兼容）
+    // GET /api/v1/users/conversation   （保留单数形式）
+    // ---------------------------------------------------------------
+    @GetMapping("/conversation")
+    public ResponseEntity<?> getActiveConversation(
             @RequestHeader("Authorization") String token,
             @RequestParam(required = false) String start_date,
             @RequestParam(required = false) String end_date) {
-        
-        LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("GET_CONVERSATIONS");
-        String username = null;
         try {
-            // 从token中提取用户名
-            username = jwtUtils.extractUsernameFromToken(token.replace("Bearer ", ""));
-            if (username == null || username.isEmpty()) {
-                LogUtils.logUserOperation("anonymous", "GET_CONVERSATIONS", "token_validation", "FAILED_INVALID_TOKEN");
-                monitor.end("获取对话历史失败：无效token");
-                throw new CustomException("无效的token", HttpStatus.UNAUTHORIZED);
+            String username = extractUsername(token);
+            String userId = resolveUserId(username);
+            // 取最新的一个会话
+            Set<String> latest = redisTemplate.opsForZSet()
+                    .reverseRange("user:" + userId + ":conversations", 0, 0);
+            if (latest == null || latest.isEmpty()) {
+                return ok("获取对话历史成功", Collections.emptyList());
             }
-            
-            LogUtils.logBusiness("GET_CONVERSATIONS", username, "开始查询用户对话历史");
-            
-            // 获取用户信息
-            User user = userRepository.findByUsername(username)
-                    .orElseThrow(() -> new CustomException("用户不存在", HttpStatus.NOT_FOUND));
-            
-            // 尝试不同格式的用户ID来查询Redis
-            List<String> possibleUserIds = new ArrayList<>();
-            possibleUserIds.add(user.getId().toString());    // 数据库ID（Long转String）
-            possibleUserIds.add(username);                 // 用户名
-            possibleUserIds.add(String.valueOf(user.getId())); // 另一种数据库ID格式
-            
-            // 检查所有Redis键，尝试找到与用户相关的会话ID
-            List<String> matchingKeys = new ArrayList<>();
-            for (String uId : possibleUserIds) {
-                String key = "user:" + uId + ":current_conversation";
-                String conversationId = redisTemplate.opsForValue().get(key);
-                if (conversationId != null) {
-                    matchingKeys.add(key);
-                    LogUtils.logBusiness("GET_CONVERSATIONS", username, "找到对话会话ID: %s", conversationId);
-                    return getConversationsFromRedis(conversationId, username, start_date, end_date, monitor);
-                }
-                
-                LogUtils.logBusiness("GET_CONVERSATIONS", username, "尝试查找Redis键: %s, 结果: 未找到", key);
-            }
-            
-            // 无法找到任何对话记录
-            LogUtils.logBusiness("GET_CONVERSATIONS", username, "没有找到对话历史，尝试过的用户ID: %s", possibleUserIds);
-            LogUtils.logUserOperation(username, "GET_CONVERSATIONS", "conversation_history", "SUCCESS_EMPTY");
-            monitor.end("获取对话历史成功（空结果）");
-            
-            // 构建统一响应格式
-            Map<String, Object> response = new HashMap<>();
-            response.put("code", 200);
-            response.put("message", "获取对话历史成功");
-            response.put("data", new ArrayList<>());
-            return ResponseEntity.ok().body(response);
-            
+            String conversationId = latest.iterator().next();
+            List<Map<String, Object>> messages = loadMessages(conversationId, start_date, end_date, username);
+            return ok("获取对话历史成功", messages);
         } catch (CustomException e) {
-            LogUtils.logBusinessError("GET_CONVERSATIONS", username, "获取对话历史失败: %s", e, e.getMessage());
-            monitor.end("获取对话历史失败: " + e.getMessage());
-            return ResponseEntity.status(e.getStatus()).body(Map.of("code", e.getStatus().value(), "message", e.getMessage()));
+            return err(e.getStatus(), e.getMessage());
         } catch (Exception e) {
-            LogUtils.logBusinessError("GET_CONVERSATIONS", username, "获取对话历史异常: %s", e, e.getMessage());
-            monitor.end("获取对话历史异常: " + e.getMessage());
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("code", 500, "message", "服务器内部错误: " + e.getMessage()));
+            return err(HttpStatus.INTERNAL_SERVER_ERROR, "服务器内部错误: " + e.getMessage());
         }
     }
-    
-    /**
-     * 从Redis获取对话历史
-     */
-    private ResponseEntity<?> getConversationsFromRedis(String conversationId, String username, String start_date, String end_date, LogUtils.PerformanceMonitor monitor) {
-        // 从Redis获取对话历史
-        String key = "conversation:" + conversationId;
-        String json = redisTemplate.opsForValue().get(key);
-        
-        List<Map<String, Object>> formattedConversations = new ArrayList<>();
-        if (json != null) {
-            try {
-                // 将原始Redis数据转换为前端可用的格式
-                List<Map<String, String>> history = objectMapper.readValue(json, 
-                        new TypeReference<List<Map<String, String>>>() {});
-                
-                // 解析时间范围
-                LocalDateTime startDateTime = null;
-                LocalDateTime endDateTime = null;
-                
-                if (start_date != null && !start_date.trim().isEmpty()) {
-                    try {
-                        startDateTime = parseDateTime(start_date);
-                        LogUtils.logBusiness("GET_CONVERSATIONS", username, "解析起始时间: %s -> %s", start_date, startDateTime);
-                    } catch (Exception e) {
-                        LogUtils.logBusinessError("GET_CONVERSATIONS", username, "起始时间解析失败: %s", e, start_date);
-                        throw new CustomException("起始时间格式错误: " + start_date, HttpStatus.BAD_REQUEST);
-                    }
-                }
-                
-                if (end_date != null && !end_date.trim().isEmpty()) {
-                    try {
-                        endDateTime = parseDateTime(end_date);
-                        LogUtils.logBusiness("GET_CONVERSATIONS", username, "解析结束时间: %s -> %s", end_date, endDateTime);
-                    } catch (Exception e) {
-                        LogUtils.logBusinessError("GET_CONVERSATIONS", username, "结束时间解析失败: %s", e, end_date);
-                        throw new CustomException("结束时间格式错误: " + end_date, HttpStatus.BAD_REQUEST);
-                    }
-                }
-                
-                // 将对话转换为前端需要的格式，使用存储的时间戳并进行时间过滤
-                for (Map<String, String> message : history) {
-                    String messageTimestamp = message.getOrDefault("timestamp", "未知时间");
-                    
-                    // 时间过滤
-                    if (startDateTime != null || endDateTime != null) {
-                        if (!"未知时间".equals(messageTimestamp)) {
-                            try {
-                                LocalDateTime messageDateTime = LocalDateTime.parse(messageTimestamp, 
-                                    DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
-                                
-                                // 检查是否在时间范围内
-                                if (startDateTime != null && messageDateTime.isBefore(startDateTime)) {
-                                    continue; // 跳过早于起始时间的消息
-                                }
-                                if (endDateTime != null && messageDateTime.isAfter(endDateTime)) {
-                                    continue; // 跳过晚于结束时间的消息
-                                }
-                            } catch (Exception e) {
-                                // 时间戳格式不正确，跳过过滤（包含所有消息）
-                                LogUtils.logBusinessError("GET_CONVERSATIONS", username, "消息时间戳格式错误: %s", e, messageTimestamp);
-                            }
-                        }
-                        // 如果是"未知时间"且设置了时间过滤，跳过该消息
-                        else if (startDateTime != null || endDateTime != null) {
-                            continue;
-                        }
-                    }
-                    
-                    Map<String, Object> messageWithTimestamp = new HashMap<>();
-                    messageWithTimestamp.put("role", message.get("role"));
-                    messageWithTimestamp.put("content", message.get("content"));
-                    messageWithTimestamp.put("timestamp", messageTimestamp);
-                    formattedConversations.add(messageWithTimestamp);
-                }
-                
-                LogUtils.logBusiness("GET_CONVERSATIONS", username, "从Redis中获取到 %d 条对话记录，过滤后剩余 %d 条，会话ID: %s", 
-                        history.size(), formattedConversations.size(), conversationId);
-                LogUtils.logUserOperation(username, "GET_CONVERSATIONS", "conversation_history", "SUCCESS");
-                monitor.end("获取对话历史成功");
-            } catch (JsonProcessingException e) {
-                LogUtils.logBusinessError("GET_CONVERSATIONS", username, "解析对话历史出错", e);
-                monitor.end("解析对话历史失败");
-                throw new CustomException("解析对话历史失败", HttpStatus.INTERNAL_SERVER_ERROR);
-            }
-        } else {
-            LogUtils.logBusiness("GET_CONVERSATIONS", username, "会话ID %s 在Redis中找不到对应的历史记录", conversationId);
-            LogUtils.logUserOperation(username, "GET_CONVERSATIONS", "conversation_history", "SUCCESS_EMPTY");
-            monitor.end("获取对话历史成功（空结果）");
+
+    // ---------------------------------------------------------------
+    // 私有工具方法
+    // ---------------------------------------------------------------
+
+    private String extractUsername(String bearerToken) {
+        String raw = bearerToken.startsWith("Bearer ") ? bearerToken.substring(7) : bearerToken;
+        String username = jwtUtils.extractUsernameFromToken(raw);
+        if (username == null || username.isBlank()) {
+            throw new CustomException("无效的token", HttpStatus.UNAUTHORIZED);
         }
-        
-        // 构建统一响应格式
-        Map<String, Object> response = new HashMap<>();
-        response.put("code", 200);
-        response.put("message", "获取对话历史成功");
-        response.put("data", formattedConversations);
-        return ResponseEntity.ok().body(response);
+        return username;
     }
-    
-    /**
-     * 解析日期时间字符串，支持多种格式
-     */
-    private LocalDateTime parseDateTime(String dateTimeStr) {
-        if (dateTimeStr == null || dateTimeStr.trim().isEmpty()) {
-            return null;
-        }
-        
+
+    private String resolveUserId(String username) {
+        User user = userRepository.findByUsername(username)
+                .orElseThrow(() -> new CustomException("用户不存在", HttpStatus.NOT_FOUND));
+        return user.getId().toString();
+    }
+
+    private List<Map<String, Object>> loadMessages(String conversationId,
+                                                    String startDate, String endDate,
+                                                    String username) {
+        String json = redisTemplate.opsForValue().get("conversation:" + conversationId);
+        if (json == null) return Collections.emptyList();
+
+        List<Map<String, String>> history;
         try {
-            // 尝试标准格式解析 (2023-01-01T12:00:00)
-            return LocalDateTime.parse(dateTimeStr);
-        } catch (DateTimeParseException e1) {
-            try {
-                // 尝试解析不带秒的格式 (2023-01-01T12:00)
-                if (dateTimeStr.length() == 16) {
-                    return LocalDateTime.parse(dateTimeStr + ":00");
-                }
-                
-                // 尝试解析不带分钟和秒的格式 (2023-01-01T12)
-                if (dateTimeStr.length() == 13) {
-                    return LocalDateTime.parse(dateTimeStr + ":00:00");
-                }
-                
-                // 尝试解析日期格式 (2023-01-01)
-                if (dateTimeStr.length() == 10) {
-                    return LocalDateTime.parse(dateTimeStr + "T00:00:00");
-                }
-                
-                // 如果以上都失败，尝试使用自定义格式解析
-                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm");
-                return LocalDateTime.parse(dateTimeStr, formatter);
-            } catch (Exception e2) {
-                LogUtils.logBusinessError("PARSE_DATETIME", "system", "无法解析日期时间: %s", e2, dateTimeStr);
-                throw new CustomException("无效的日期格式: " + dateTimeStr, HttpStatus.BAD_REQUEST);
-            }
+            history = objectMapper.readValue(json, new TypeReference<>() {});
+        } catch (JsonProcessingException e) {
+            LogUtils.logBusinessError("GET_MESSAGES", username, "解析历史失败", e);
+            throw new CustomException("解析消息历史失败", HttpStatus.INTERNAL_SERVER_ERROR);
         }
+
+        LocalDateTime startDt = startDate != null ? parseDateTime(startDate) : null;
+        LocalDateTime endDt = endDate != null ? parseDateTime(endDate) : null;
+
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, String> msg : history) {
+            String ts = msg.getOrDefault("timestamp", "");
+            if ((startDt != null || endDt != null) && !ts.isEmpty()) {
+                try {
+                    LocalDateTime msgDt = LocalDateTime.parse(ts,
+                            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
+                    if (startDt != null && msgDt.isBefore(startDt)) continue;
+                    if (endDt != null && msgDt.isAfter(endDt)) continue;
+                } catch (Exception ignored) {}
+            }
+            Map<String, Object> item = new HashMap<>();
+            item.put("role", msg.get("role"));
+            item.put("content", msg.get("content"));
+            item.put("timestamp", ts);
+            result.add(item);
+        }
+        return result;
     }
 
+    private LocalDateTime parseDateTime(String s) {
+        if (s == null || s.isBlank()) return null;
+        try { return LocalDateTime.parse(s); } catch (DateTimeParseException ignored) {}
+        if (s.length() == 16) return LocalDateTime.parse(s + ":00");
+        if (s.length() == 10) return LocalDateTime.parse(s + "T00:00:00");
+        throw new CustomException("无效的日期格式: " + s, HttpStatus.BAD_REQUEST);
+    }
 
+    private ResponseEntity<Map<String, Object>> ok(String message, Object data) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("code", 200);
+        body.put("message", message);
+        body.put("data", data);
+        return ResponseEntity.ok(body);
+    }
+
+    private ResponseEntity<Map<String, Object>> err(HttpStatus status, String message) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("code", status.value());
+        body.put("message", message);
+        return ResponseEntity.status(status).body(body);
+    }
 }
